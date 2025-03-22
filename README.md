@@ -53,10 +53,10 @@ python annotate_variants.py -i variants.vcf --ref reference.gbk -o annotated_var
 
 ### **3. Output (Annotated VCF File)**
 ```
-#CHROM  POS     ID      REF     ALT     Gene_ID
-chr1    500     .       A       T       ABC1
-chr1    1200    .       G       C       Intergenic
-chr1    3000    .       T       A       XYZ2
+#CHROM  POS     ID      REF     ALT     Gene_ID     Variant_Effect
+chr1    500     .       A       T       ABC1        Coding
+chr1    1200    .       G       C       Intergenic  Intergenic
+chr1    3000    .       T       A       XYZ2        Coding
 ```
 
 ---
