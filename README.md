@@ -1,6 +1,6 @@
 # Annotate Variants with Gene Information
 
-`annotate_variants.py` is a Python script that annotates a VCF file with gene information from a GenBank reference file. It matches variant positions to known genes & adds an extra column to indicate the corresponding Gene ID or labels it as **Intergenic**.
+`annotate_variants.py` is a Python script that annotates a VCF file with gene information from a GenBank reference file. It matches variant positions to known genes and adds two extra columns: **Gene_ID**, indicating the corresponding gene or labeling it as Intergenic, and **Variant_Effect**, describing the variant’s functional context (e.g., Coding, Intergenic).
 
 ## Features
 - Extracts **gene annotations** from a GenBank reference file.
