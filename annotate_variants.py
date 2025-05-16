@@ -1,103 +1,158 @@
 import argparse
 import os
+import sys
 from Bio import SeqIO, Seq
-from Bio.Seq import MutableSeq
+from Bio.SeqRecord import SeqRecord
+from intervaltree import Interval, IntervalTree
+import gzip
 
-# Set up command-line argument parsing
-parser = argparse.ArgumentParser(description="Annotate a VCF file with gene and variant effect from a GenBank reference.")
-parser.add_argument("-i", "--input_vcf", required=True, help="Input VCF file")
-parser.add_argument("--ref", "--reference_gb", required=True, help="Reference GenBank file")
-parser.add_argument("-o", "--output_vcf", required=True, help="Output annotated VCF file")
-args = parser.parse_args()
+def parse_args():
+    parser = argparse.ArgumentParser(description="Annotate VCF with gene and variant effect from GenBank")
+    parser.add_argument("-i", "--input", required=True, help="Input VCF file")
+    parser.add_argument("-r", "--reference", required=True, help="Reference GenBank file")
+    parser.add_argument("-o", "--output", required=True, help="Output annotated VCF file")
+    parser.add_argument("--compress", action="store_true", help="Compress output with gzip")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show progress messages")
+    return parser.parse_args()
 
-# Validate input files
-if not os.path.isfile(args.input_vcf):
-    raise FileNotFoundError(f"Error: VCF file '{args.input_vcf}' not found.")
-if not os.path.isfile(args.ref):
-    raise FileNotFoundError(f"Error: GenBank file '{args.ref}' not found.")
+class GenbankParser:
+    def __init__(self, gb_file):
+        self.genes = IntervalTree()
+        self.cds_features = []
+        self.translation_tables = {}
+        
+        try:
+            for record in SeqIO.parse(gb_file, "genbank"):
+                self.sequence = record.seq
+                for feat in record.features:
+                    self._process_feature(feat)
+        except Exception as e:
+            raise ValueError(f"Invalid GenBank file: {str(e)}")
 
-# Parse GenBank to extract gene & CDS regions
-gene_annotations = {}
-cds_features = []
+    def _process_feature(self, feat):
+        start = feat.location.start.position + 1  # 1-based
+        end = feat.location.end.position
+        strand = feat.location.strand
+        
+        if feat.type == "gene":
+            gene_id = feat.qualifiers.get("gene", ["Unknown"])[0]
+            self.genes.addi(start, end, (gene_id, strand))
+            
+        elif feat.type == "CDS":
+            transl_table = int(feat.qualifiers.get("transl_table", ["11"])[0])
+            gene_id = feat.qualifiers.get("gene", ["Unknown"])[0]
+            self.cds_features.append({
+                'start': start,
+                'end': end,
+                'strand': strand,
+                'gene': gene_id,
+                'transl_table': transl_table
+            })
 
-record = SeqIO.read(args.ref, "genbank")
-sequence = record.seq
+class VCFAnnotator:
+    def __init__(self, gb_parser):
+        self.gb = gb_parser
+        
+    def _get_coding_effect(self, pos, ref, alt, chrom):
+        # Handle only SNPs for amino acid changes
+        if len(ref) != 1 or len(alt) != 1:
+            return "Non-SNP", "Intergenic"
+            
+        # Find overlapping genes
+        gene_hits = self.gb.genes.at(pos)
+        if not gene_hits:
+            return "Intergenic", "Intergenic"
+            
+        # Check CDS regions
+        for cds in self.gb.cds_features:
+            if cds['start'] <= pos <= cds['end']:
+                return self._calculate_amino_acid_change(pos, ref, alt, cds)
+                
+        return "Non-coding", gene_hits.pop().data[0]
 
-for feature in record.features:
-    if feature.type == "gene":
-        gene_id = feature.qualifiers.get("gene", ["Unknown"])[0]
-        for pos in range(int(feature.location.start) + 1, int(feature.location.end) + 1):
-            gene_annotations[pos] = gene_id
-    elif feature.type == "CDS":
-        cds_features.append(feature)
+    def _calculate_amino_acid_change(self, pos, ref, alt, cds):
+        try:
+            # Get relative position in CDS
+            cds_pos = pos - cds['start']
+            if cds['strand'] == -1:
+                cds_pos = cds['end'] - pos
+                
+            # Extract codon (0-based in 3bp chunks)
+            codon_num, offset = divmod(cds_pos, 3)
+            codon_start = cds['start'] + codon_num*3
+            codon_end = codon_start + 3
+            
+            # Get original codon
+            codon = self.gb.sequence[codon_start-1:codon_end-1]
+            if cds['strand'] == -1:
+                codon = codon.reverse_complement()
+                
+            # Create mutated codon
+            mut_codon = list(str(codon))
+            mut_codon[offset] = alt if cds['strand'] == 1 else Seq.Seq(alt).reverse_complement()[0]
+            mut_codon = Seq.Seq(''.join(mut_codon))
+            
+            # Translate
+            table = cds['transl_table']
+            orig_aa = codon.translate(table=table)
+            new_aa = mut_codon.translate(table=table)
+            
+            return ("Synonymous" if orig_aa == new_aa else "Missense"), cds['gene']
+            
+        except Exception:
+            return "Translation-Error", cds['gene']
 
-# Function to check if variant causes missense or synonymous change
-def get_variant_effect(pos, ref_allele, alt_allele):
-    # Only handle SNPs (length 1 substitutions)
-    if len(ref_allele) != 1 or len(alt_allele) != 1:
-        return gene_annotations.get(pos, "Intergenic"), "Non-SNP"
+def main():
+    args = parse_args()
+    
+    # Validate inputs
+    for f in [args.input, args.reference]:
+        if not os.path.exists(f):
+            sys.exit(f"Error: Input file {f} not found")
 
-    for cds in cds_features:
-        start = int(cds.location.start) + 1
-        end = int(cds.location.end)
-        strand = cds.location.strand
-        if start <= pos <= end:
-            gene_id = cds.qualifiers.get("gene", ["Unknown"])[0]
-            coding_seq = cds.extract(sequence)
-            codon_pos = (pos - start) if strand == 1 else (end - pos)
-            codon_index = codon_pos // 3
-            base_index = codon_pos % 3
-            if codon_index >= len(coding_seq) // 3:
-                return gene_id, "Non-coding"
+    # Parse GenBank
+    try:
+        gb_parser = GenbankParser(args.reference)
+    except Exception as e:
+        sys.exit(f"GenBank parsing failed: {str(e)}")
 
-            codon = coding_seq[codon_index * 3: codon_index * 3 + 3]
-            if len(codon) != 3:
-                return gene_id, "Non-coding"
+    # Initialize annotator
+    annotator = VCFAnnotator(gb_parser)
+    
+    # Handle compressed output
+    opener = gzip.open if args.compress else open
+    mode = 'wt' if args.compress else 'w'
+    
+    with opener(args.output, mode) as out:
+        # Process VCF
+        with gzip.open(args.input, 'rt') if args.input.endswith('.gz') else open(args.input) as vcf:
+            for line in vcf:
+                if line.startswith('##'):
+                    if 'INFO' not in line:
+                        out.write(line)
+                    continue
+                        
+                if line.startswith('#CHROM'):
+                    header = line.strip().split('\t')
+                    header += ['##INFO=<ID=GENE,Number=1,Type=String,Description="Gene identifier">']
+                    header += ['##INFO=<ID=EFFECT,Number=1,Type=String,Description="Variant effect">']
+                    out.write('\t'.join(header) + '\n')
+                    continue
+                
+                parts = line.strip().split('\t')
+                if len(parts) < 5:
+                    continue
+                
+                chrom, pos, = parts[0], int(parts[1])
+                ref, alts = parts[3], parts[4].split(',')
+                
+                annotations = []
+                for alt in alts:
+                    effect, gene = annotator._get_coding_effect(pos, ref, alt, chrom)
+                    annotations.append(f"GENE={gene};EFFECT={effect}")
+                
+                parts[7] = ';'.join([parts[7]] + annotations) if parts[7] != '.' else ';'.join(annotations)
+                out.write('\t'.join(parts) + '\n')
 
-            ref_codon = MutableSeq(str(codon))
-            if strand == 1:
-                ref_codon[base_index] = alt_allele
-            else:
-                comp_alt = Seq.Seq(alt_allele).complement()
-                ref_codon[2 - base_index] = str(comp_alt)[0]  # Use only first character
-
-            new_codon = Seq.Seq(str(ref_codon))
-
-            try:
-                ref_aa = codon.translate()
-                alt_aa = new_codon.translate()
-            except Exception:
-                return gene_id, "TranslationError"
-
-            if ref_aa == alt_aa:
-                return gene_id, "Synonymous"
-            else:
-                return gene_id, "Missense"
-
-    return gene_annotations.get(pos, "Intergenic"), "Non-coding"
-
-# Annotate the VCF file
-vcf_data = []
-with open(args.input_vcf, "r") as vcf:
-    for line in vcf:
-        if line.startswith("#"):
-            if line.startswith("#CHROM"):
-                vcf_data.append(line.strip() + "\tGene_ID\tVariant_Effect")
-            else:
-                vcf_data.append(line.strip())
-        else:
-            columns = line.strip().split("\t")
-            if len(columns) < 5:
-                continue
-            chrom, pos, vid, ref, alt = columns[:5]
-            pos = int(pos)
-            gene_id, effect = get_variant_effect(pos, ref, alt)
-            annotated_line = line.strip() + f"\t{gene_id}\t{effect}"
-            vcf_data.append(annotated_line)
-
-# Save the annotated VCF
-with open(args.output_vcf, "w") as out:
-    for entry in vcf_data:
-        out.write(entry + "\n")
-
-print(f"Annotated VCF with gene and variant effect saved to: {args.output_vcf}")
+if __name__ == "__main__":
+    main()
